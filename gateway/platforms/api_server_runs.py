@@ -37,14 +37,6 @@ _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
 _USAGE_FIELDS = (
     ("input_tokens", "session_prompt_tokens"), ("output_tokens", "session_completion_tokens"),
     ("total_tokens", "session_total_tokens"))
-# Tool-progress event -> SSE payload fields (tool_name, preview, kwargs); key order is wire format.
-_FIXED_EVENT_FIELDS = {
-    "tool.started": lambda tool, preview, kw: {"tool": tool, "preview": preview},
-    "tool.completed": lambda tool, preview, kw: {
-        "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
-    "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
-
-
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
@@ -147,8 +139,9 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
 
 
 def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
-    """Return a callback that pushes structured events to the run SSE queue."""
+    """Return callbacks that publish the public, ordered run timeline."""
     redact_sensitive_text = _api_server.redact_sensitive_text
+    from agent.turn_summary import tool_activity_label
 
     def _push(event: Dict[str, Any]) -> None:
         self._set_run_status(
@@ -158,13 +151,10 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             with suppress(Exception):
                 loop.call_soon_threadsafe(q.put_nowait, event)
 
-    def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-        # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
-        # lifecycle boundaries must land so clients can observe delegate_task failures.
-        fields = _FIXED_EVENT_FIELDS.get(event_type)
-        if fields is not None:
-            _push(_run_event(run_id, event_type, **fields(tool_name, preview, kwargs)))
-        elif event_type in {"subagent.start", "subagent.complete"}:
+    def _progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        # Stable tool events come from the dedicated callbacks below. The progress callback
+        # remains the source for lifecycle boundaries only.
+        if event_type in {"subagent.start", "subagent.complete"}:
             event = _run_event(run_id, event_type)
             if preview is not None:
                 event["preview"] = redact_sensitive_text(str(preview), force=True)
@@ -176,7 +166,32 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
                     event[key] = redact_sensitive_text(value, force=True) if redact else value
             _push(event)
 
-    return _callback
+    def _tool_started(tool_call_id: str, tool_name: str, _args: Any) -> None:
+        _push(_run_event(
+            run_id, "tool.started", tool_call_id=str(tool_call_id), tool=tool_name,
+            label=tool_activity_label(tool_name)))
+
+    def _tool_completed(tool_call_id: str, tool_name: str, _args: Any, result: Any) -> None:
+        is_error = False
+        if isinstance(result, dict):
+            is_error = bool(result.get("error") or result.get("is_error"))
+        elif isinstance(result, str):
+            with suppress(Exception):
+                parsed = json.loads(result, strict=False)
+                if isinstance(parsed, dict):
+                    is_error = bool(parsed.get("error") or parsed.get("is_error"))
+        _push(_run_event(
+            run_id, "tool.completed", tool_call_id=str(tool_call_id), tool=tool_name,
+            label=tool_activity_label(tool_name), error=is_error))
+
+    def _interim(text: str, **_kwargs: Any) -> None:
+        if not isinstance(text, str) or not text.strip():
+            return
+        _push(_run_event(
+            run_id, "message.interim",
+            text=redact_sensitive_text(text.strip(), force=True)))
+
+    return _progress, _tool_started, _tool_completed, _interim
 
 
 def _room_permission_for(request: "web.Request") -> str:
@@ -697,9 +712,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
+            progress_cb, tool_start_cb, tool_complete_cb, interim_cb = (
+                self._make_run_event_callback(run_id, loop))
             agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                **run.agent_kwargs)
+                stream_delta_callback=_text_cb, tool_progress_callback=progress_cb,
+                tool_start_callback=tool_start_cb, tool_complete_callback=tool_complete_cb,
+                interim_assistant_callback=interim_cb, **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(

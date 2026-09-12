@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -417,6 +418,70 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_public_timeline_is_ordered_correlated_and_redacted(self, adapter):
+        app = _create_runs_app(adapter)
+
+        def create_agent(**callbacks):
+            agent = MagicMock()
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+
+            def run_conversation(**_kwargs):
+                callbacks["interim_assistant_callback"](
+                    "I'll inspect the repo.", already_streamed=False
+                )
+                callbacks["tool_start_callback"](
+                    "call-a", "terminal", {"command": "SECRET_COMMAND"}
+                )
+                callbacks["tool_start_callback"](
+                    "call-b", "terminal", {"command": "OTHER_SECRET"}
+                )
+                callbacks["tool_complete_callback"](
+                    "call-b", "terminal", {}, '{"error": "SECRET_OUTPUT"}'
+                )
+                callbacks["tool_complete_callback"](
+                    "call-a", "terminal", {}, '{"success": true}'
+                )
+                callbacks["tool_progress_callback"](
+                    "reasoning.available", "_thinking", "SECRET_REASONING", None
+                )
+                return {"final_response": "done"}
+
+            agent.run_conversation.side_effect = run_conversation
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert [
+            (event["event"], event.get("tool_call_id")) for event in events
+        ] == [
+            ("message.interim", None),
+            ("tool.started", "call-a"),
+            ("tool.started", "call-b"),
+            ("tool.completed", "call-b"),
+            ("tool.completed", "call-a"),
+            ("run.completed", None),
+        ]
+        assert body.count('"tool": "terminal"') == 4
+        assert body.count('"label": "Run command"') == 4
+        assert '"error": true' in body
+        assert '"error": false' in body
+        assert "SECRET_COMMAND" not in body
+        assert "OTHER_SECRET" not in body
+        assert "SECRET_OUTPUT" not in body
+        assert "SECRET_REASONING" not in body
+
     @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""

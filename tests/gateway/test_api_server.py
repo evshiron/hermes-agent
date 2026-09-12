@@ -907,6 +907,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["run_goals"] is True
+            assert data["features"]["run_interim_messages"] is True
             assert data["features"]["runs_idempotency"] == {
                 "supported": True,
                 "durable": True,
