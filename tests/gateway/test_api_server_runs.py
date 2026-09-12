@@ -101,6 +101,8 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     )
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_get("/v1/runs/{run_id}/goal", adapter._handle_run_goal)
+    app.router.add_post("/v1/runs/{run_id}/goal", adapter._handle_run_goal)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
@@ -2194,3 +2196,78 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+class TestRunGoals:
+    @pytest.mark.asyncio
+    async def test_goal_control_is_run_owned_and_persistent(self, adapter):
+        from hermes_cli import goals
+
+        goals._DB_CACHE.clear()
+        app = _create_runs_app(adapter)
+        _claim_run(adapter, "run_goal")
+        adapter._set_run_status("run_goal", "completed", session_id="goal-session")
+        async with TestClient(TestServer(app)) as cli:
+            created = await cli.post(
+                "/v1/runs/run_goal/goal",
+                json={"action": "create", "objective": "finish the migration", "max_turns": 9},
+            )
+            assert created.status == 200
+            payload = await created.json()
+            assert payload["goal"]["goal"] == "finish the migration"
+            assert payload["goal"]["max_turns"] == 9
+            assert adapter._run_statuses["run_goal"]["status"] == "completed"
+
+            paused = await cli.post(
+                "/v1/runs/run_goal/goal", json={"action": "pause", "reason": "waiting"})
+            assert (await paused.json())["goal"]["status"] == "paused"
+
+            fetched = await cli.get("/v1/runs/run_goal/goal")
+            assert fetched.status == 200
+            assert (await fetched.json())["goal"]["paused_reason"] == "waiting"
+
+            missing = await cli.get("/v1/runs/not_owned/goal")
+            assert missing.status == 404
+
+    @pytest.mark.asyncio
+    async def test_active_goal_continues_inside_one_run(self, adapter, monkeypatch):
+        from hermes_cli import goals
+
+        goals._DB_CACHE.clear()
+        verdicts = iter([
+            ("continue", "more work remains", False, None, False),
+            ("done", "verified", False, None, False),
+        ])
+        monkeypatch.setattr(goals, "judge_goal", lambda *_a, **_kw: next(verdicts))
+        goals.GoalManager("goal-loop-session").set("finish autonomously", max_turns=5)
+
+        agent = MagicMock()
+        calls = []
+
+        def run_conversation(**kwargs):
+            calls.append(kwargs)
+            return {
+                "final_response": f"answer {len(calls)}",
+                "messages": [{"role": "assistant", "content": f"answer {len(calls)}"}],
+            }
+
+        agent.run_conversation.side_effect = run_conversation
+        agent.session_id = "goal-loop-session"
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "begin", "session_id": "goal-loop-session"})
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert calls[0]["user_message"] == "begin"
+        assert len(calls) == 2
+        assert "finish autonomously" in calls[1]["user_message"]
+        assert status["output"] == "answer 2"
+        assert status["goal"]["status"] == "done"

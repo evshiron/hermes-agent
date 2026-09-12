@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -100,6 +100,8 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+        ("GET", "/v1/runs/{run_id}/goal", self._handle_run_goal),
+        ("POST", "/v1/runs/{run_id}/goal", self._handle_run_goal),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
@@ -135,7 +137,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     should_persist = (
         status != previous_status
         or status in TERMINAL_STATUSES
-        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"}))
+        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id", "goal"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -504,7 +506,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
-def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
+def _goal_snapshot(session_id: str) -> Optional[dict[str, Any]]:
+    """Return the persisted goal wire shape for *session_id*."""
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_id).state
+    return asdict(state) if state is not None else None
+
+
+def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, goal_notify, *, _api_server):
     """Executor-thread body of one run; returns ``(result, usage)``."""
     from gateway.session_context import clear_session_vars
     from gateway.hosted_room_execution_policy import (
@@ -555,6 +565,62 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
+            while (
+                isinstance(r, dict) and not r.get("failed") and not r.get("interrupted")
+                and r.get("completed", True) is not False
+            ):
+                response = r.get("final_response")
+                if not isinstance(response, str) or not response.strip():
+                    break
+                agent_session_id = getattr(agent, "session_id", None)
+                live_session_id = (
+                    agent_session_id.strip()
+                    if isinstance(agent_session_id, str) and agent_session_id.strip()
+                    else run.session_id)
+                run.session_id = live_session_id
+                from hermes_cli.goals import GoalManager, count_active_delegations, gather_background_processes
+                goal_manager = GoalManager(live_session_id)
+                if not goal_manager.is_active():
+                    break
+                if r.get("compression_exhausted"):
+                    goal_manager.pause(reason="context compression exhausted during Runs API goal")
+                    goal_notify(live_session_id, {
+                        "status": "paused", "verdict": "interrupted",
+                        "reason": "context compression exhausted",
+                        "message": "Goal paused because context compression was exhausted.",
+                    })
+                    break
+                try:
+                    background_processes = gather_background_processes(owner_task_id=effective_task_id)
+                    active_delegations = count_active_delegations(live_session_id)
+                except Exception:
+                    background_processes, active_delegations = None, 0
+                try:
+                    decision = goal_manager.evaluate_after_turn(
+                        response, user_initiated=True, background_processes=background_processes,
+                        active_delegations=active_delegations)
+                except Exception as exc:
+                    logger.exception("[api_server] goal evaluation failed for run %s", run.run_id)
+                    goal_manager.pause(reason="goal evaluation failed")
+                    goal_notify(live_session_id, {
+                        "status": "paused", "verdict": "error", "reason": "goal evaluation failed",
+                        "message": "Goal paused because evaluation failed.",
+                    })
+                    break
+                goal_notify(live_session_id, decision)
+                # Preserve undelivered human steer for the client replay contract; it wins over
+                # synthesized goal continuation, matching the interactive gateway.
+                if r.get("pending_steer"):
+                    break
+                continuation = decision.get("continuation_prompt") if decision.get("should_continue") else None
+                if not continuation or run.run_id in self._stopping_run_ids:
+                    break
+                history = r.get("messages")
+                if not isinstance(history, list):
+                    history = run.conversation_history
+                r = agent.run_conversation(
+                    user_message=continuation, conversation_history=history,
+                    task_id=effective_task_id)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
@@ -613,6 +679,18 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
 
+    def _goal_notify(session_id: str, decision: dict[str, Any]) -> None:
+        def _publish() -> None:
+            goal = _goal_snapshot(session_id)
+            self._set_run_status(
+                run_id, self._run_statuses.get(run_id, {}).get("status", "running"),
+                session_id=session_id, goal=goal, last_event="goal.updated")
+            run.put_event(_run_event(
+                run_id, "goal.updated", session_id=session_id, goal=goal,
+                decision={k: decision.get(k) for k in ("status", "verdict", "reason", "message")}))
+        with suppress(Exception):
+            loop.call_soon_threadsafe(_publish)
+
     try:
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
@@ -625,7 +703,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
-            None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+            None, lambda: _run_agent_sync(
+                self, run, agent, approval_notify, _goal_notify, _api_server=_api_server))
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
@@ -636,6 +715,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
+            extra.update(session_id=run.session_id, goal=_goal_snapshot(run.session_id))
             _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
         _finish("cancelled")
@@ -712,6 +792,68 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
     return err or web.json_response(status)
+
+
+async def _handle_run_goal(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Read or mutate the persistent goal associated with an owned run."""
+    permission = "status" if request.method == "GET" else "dispatch"
+    run_id, status, agent, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission=permission, active_fallback=True)
+    if err is not None:
+        return err
+    agent_session_id = getattr(agent, "session_id", None)
+    session_id = (
+        agent_session_id.strip()
+        if isinstance(agent_session_id, str) and agent_session_id.strip()
+        else str(status.get("session_id") or ""))
+    if not session_id:
+        return _json_error(
+            _api_server._openai_error, "Run has no persistent session", code="goal_session_missing", status=409)
+    from hermes_cli.goals import GoalManager
+    manager = GoalManager(session_id)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_error(_api_server._openai_error, "Invalid JSON", status=400)
+        action = str(body.get("action") or "").strip().lower()
+        try:
+            if action == "create":
+                max_turns = body.get("max_turns")
+                if max_turns is not None and (isinstance(max_turns, bool) or int(max_turns) < 1):
+                    raise ValueError("max_turns must be a positive integer")
+                manager.set(str(body.get("objective") or ""), max_turns=max_turns)
+            elif action == "pause":
+                if manager.pause(str(body.get("reason") or "api-paused")) is None:
+                    raise RuntimeError("no goal exists")
+            elif action == "resume":
+                if manager.resume(reset_budget=bool(body.get("reset_budget", False))) is None:
+                    raise RuntimeError("no goal exists")
+            elif action == "complete":
+                if manager.state is None:
+                    raise RuntimeError("no goal exists")
+                manager.mark_done(str(body.get("reason") or "completed via Runs API"))
+            elif action == "clear":
+                if manager.state is None:
+                    raise RuntimeError("no goal exists")
+                manager.clear()
+            else:
+                raise ValueError("action must be one of: create, pause, resume, complete, clear")
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return _json_error(
+                _api_server._openai_error, str(exc), code="invalid_goal_operation", status=400)
+        goal = _goal_snapshot(session_id)
+        current_status = self._run_statuses.get(run_id, {}).get("status", status.get("status", "running"))
+        self._set_run_status(
+            run_id, current_status, session_id=session_id, goal=goal, last_event="goal.updated")
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            with suppress(Exception):
+                q.put_nowait(_run_event(
+                    run_id, "goal.updated", session_id=session_id, goal=goal))
+    return web.json_response({
+        "object": "hermes.goal", "run_id": run_id, "session_id": session_id,
+        "goal": _goal_snapshot(session_id)})
 
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
