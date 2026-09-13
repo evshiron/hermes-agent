@@ -66,7 +66,8 @@ _BROWSER_CONTROL_PROTOCOL_VERSION = 1
 # /v1/capabilities static feature flags (order is part of the JSON shape).
 _STATIC_FEATURE_FLAGS = {
     "run_status": True, "run_events_sse": True, "run_stop": True, "run_steer": True,
-    "run_goals": True, "run_interim_messages": True,
+    "run_goals": True, "session_goal_control": True, "goal_run_modes": True,
+    "run_interim_messages": True,
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
@@ -80,6 +81,8 @@ _CAPABILITY_ENDPOINTS = (
     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
     ("chat_completions", ("POST", "/v1/chat/completions")),
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
+    ("session_goal", ("GET", "/v1/sessions/{session_id}/goal")),
+    ("session_goal_update", ("POST", "/v1/sessions/{session_id}/goal")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_goal", ("GET", "/v1/runs/{run_id}/goal")),
@@ -3814,6 +3817,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     _handle_get_run = _run_route_delegate("_handle_get_run")
     _handle_run_events = _run_route_delegate("_handle_run_events")
+    _handle_session_goal = _run_route_delegate("_handle_session_goal")
     _handle_run_goal = _run_route_delegate("_handle_run_goal")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")

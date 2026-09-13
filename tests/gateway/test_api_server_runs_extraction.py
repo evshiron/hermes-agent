@@ -173,7 +173,11 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
     assert [(method, path) for method, path, _ in run_routes] == [
         ("POST", "/v1/runs"),
         ("GET", "/v1/runs/{run_id}"),
+        ("GET", "/v1/sessions/{session_id}/goal"),
+        ("POST", "/v1/sessions/{session_id}/goal"),
         ("GET", "/v1/runs/{run_id}/events"),
+        ("GET", "/v1/runs/{run_id}/goal"),
+        ("POST", "/v1/runs/{run_id}/goal"),
         ("POST", "/v1/runs/{run_id}/approval"),
         ("POST", "/v1/runs/{run_id}/steer"),
         ("POST", "/v1/runs/{run_id}/stop"),

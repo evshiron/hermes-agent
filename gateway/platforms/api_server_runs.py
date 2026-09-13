@@ -91,6 +91,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        ("GET", "/v1/sessions/{session_id}/goal", self._handle_session_goal),
+        ("POST", "/v1/sessions/{session_id}/goal", self._handle_session_goal),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("GET", "/v1/runs/{run_id}/goal", self._handle_run_goal),
         ("POST", "/v1/runs/{run_id}/goal", self._handle_run_goal),
@@ -421,14 +423,23 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             {"body": body, "gateway_session_key": gateway_session_key or ""},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
+    mode = str(body.get("mode") or "default").strip().lower()
+    if mode not in {"default", "goal_start", "goal_resume"}:
+        return _json_error(
+            _openai_error, "mode must be one of: default, goal_start, goal_resume",
+            code="invalid_run_mode", status=400)
+    goal_objective = str(body.get("goal") or "").strip()
+    if mode == "goal_start" and not goal_objective:
+        return _json_error(
+            _openai_error, "goal text is empty", code="invalid_goal_operation", status=400)
     raw_input = body.get("input")
-    if not raw_input:
+    if not raw_input and mode == "default":
         return _json_error(_openai_error, "Missing 'input' field", status=400)
     if isinstance(raw_input, str):
         user_message = raw_input
     else:
         user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
-    if not user_message:
+    if not user_message and mode == "default":
         return _json_error(_openai_error, "No user message found in input", status=400)
     try:
         turn_author = _api_server._request_turn_author(body)
@@ -440,6 +451,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return history_err
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
+    if mode != "default" and not session_id:
+        return _json_error(
+            _openai_error, "Goal run modes require an explicit session_id",
+            code="goal_session_missing", status=400)
     route = self._resolve_route(body.get("model"))
     agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
@@ -474,6 +489,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if selected_session_id:
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
     session_id = selected_session_id or run_id
+    if mode == "goal_resume":
+        from hermes_cli.goals import GoalManager
+        resumable = GoalManager(session_id).state
+        if resumable is None or resumable.status in {"done", "cleared"}:
+            _forget_run(self, run_id, self._run_owners)
+            return _json_error(
+                _openai_error, "no resumable goal exists", code="goal_not_resumable", status=409)
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
     # same-key run's context (#98619).  previous_response_id continuations keep their
@@ -501,6 +523,22 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    if mode != "default":
+        from hermes_cli.goals import GoalManager, goal_kick_prompt
+        manager = GoalManager(session_id)
+        if mode == "goal_start":
+            manager.set(goal_objective)
+            user_message = goal_kick_prompt(goal_objective, "")
+        else:
+            manager.resume(reset_budget=True)
+            user_message = manager.next_continuation_prompt() or ""
+        self._set_run_status(
+            run_id, "queued", created_at=created_at, session_id=session_id,
+            model=body.get("model", self._model_name), goal=_goal_snapshot(session_id))
+        q.put_nowait(_run_event(
+            run_id, "goal.updated", session_id=session_id, goal=_goal_snapshot(session_id),
+            decision={"status": "active", "verdict": "continue", "reason": None,
+                      "message": "Continuing toward goal"}))
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -577,6 +615,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, goal_notify, 
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
+            goal_before_turn = _goal_snapshot(session_id)
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
@@ -596,6 +635,16 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, goal_notify, 
                 from hermes_cli.goals import GoalManager, count_active_delegations, gather_background_processes
                 goal_manager = GoalManager(live_session_id)
                 if not goal_manager.is_active():
+                    goal_after_turn = _goal_snapshot(live_session_id)
+                    if goal_after_turn != goal_before_turn:
+                        status = goal_after_turn.get("status") if goal_after_turn else "cleared"
+                        reason = (
+                            goal_after_turn.get("paused_reason") or goal_after_turn.get("last_reason")
+                            if goal_after_turn else None)
+                        goal_notify(live_session_id, {
+                            "status": status, "verdict": status, "reason": reason,
+                            "message": f"Goal {status} by agent tool.",
+                        })
                     break
                 if r.get("compression_exhausted"):
                     goal_manager.pause(reason="context compression exhausted during Runs API goal")
@@ -633,6 +682,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, goal_notify, 
                 history = r.get("messages")
                 if not isinstance(history, list):
                     history = run.conversation_history
+                goal_before_turn = _goal_snapshot(live_session_id)
                 r = agent.run_conversation(
                     user_message=continuation, conversation_history=history,
                     task_id=effective_task_id)
@@ -861,6 +911,12 @@ async def _handle_run_goal(self, request: "web.Request", *, _api_server) -> "web
             return _json_error(
                 _api_server._openai_error, str(exc), code="invalid_goal_operation", status=400)
         goal = _goal_snapshot(session_id)
+        messages = {
+            "create": "Continuing toward goal",
+            "pause": f"Goal paused because {body.get('reason') or 'api-paused'}",
+            "resume": "Continuing toward goal",
+            "clear": "Goal cleared",
+        }
         current_status = self._run_statuses.get(run_id, {}).get("status", status.get("status", "running"))
         self._set_run_status(
             run_id, current_status, session_id=session_id, goal=goal, last_event="goal.updated")
@@ -872,6 +928,61 @@ async def _handle_run_goal(self, request: "web.Request", *, _api_server) -> "web
     return web.json_response({
         "object": "hermes.goal", "run_id": run_id, "session_id": session_id,
         "goal": _goal_snapshot(session_id)})
+
+
+async def _handle_session_goal(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Read or mutate a goal by durable session identity, without a retained run."""
+    auth_err = self._check_auth(request)
+    if auth_err:
+        return auth_err
+    session_id = str(request.match_info.get("session_id") or "").strip()
+    if not session_id or len(session_id) > 256 or any(ord(ch) < 32 for ch in session_id):
+        return _json_error(
+            _api_server._openai_error, "invalid session_id", code="invalid_session_id", status=400)
+    from hermes_cli.goals import GoalManager
+    manager = GoalManager(session_id)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_error(_api_server._openai_error, "Invalid JSON", status=400)
+        action = str(body.get("action") or "").strip().lower()
+        try:
+            if action == "create":
+                manager.set(str(body.get("objective") or ""), max_turns=body.get("max_turns"))
+            elif action == "pause":
+                if manager.pause(str(body.get("reason") or "api-paused")) is None:
+                    raise RuntimeError("no goal exists")
+            elif action == "resume":
+                state = manager.state
+                if state is None or state.status in {"done", "cleared"}:
+                    raise RuntimeError("no resumable goal exists")
+                manager.resume(reset_budget=bool(body.get("reset_budget", True)))
+            elif action == "clear":
+                if manager.state is None:
+                    raise RuntimeError("no goal exists")
+                manager.clear()
+            else:
+                raise ValueError("action must be one of: create, pause, resume, clear")
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return _json_error(
+                _api_server._openai_error, str(exc), code="invalid_goal_operation", status=400)
+        goal = _goal_snapshot(session_id)
+        # A session control can occur while a run is active. Publish the state change on every
+        # matching live run so clients do not have to poll to observe pause/clear.
+        for run_id, status in list(self._run_statuses.items()):
+            if status.get("session_id") != session_id or run_id not in self._run_streams:
+                continue
+            self._set_run_status(
+                run_id, status.get("status", "running"), session_id=session_id,
+                goal=goal, last_event="goal.updated")
+            with suppress(Exception):
+                self._run_streams[run_id].put_nowait(_run_event(
+                    run_id, "goal.updated", session_id=session_id, goal=goal,
+                    decision={"status": goal.get("status") if goal else "cleared",
+                              "message": messages[action]}))
+    return web.json_response({
+        "object": "hermes.goal", "session_id": session_id, "goal": _goal_snapshot(session_id)})
 
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":

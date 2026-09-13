@@ -669,7 +669,7 @@ class TestRunEventCallback:
         adapter._run_streams[run_id] = queue
         adapter._run_statuses.pop(run_id, None)
 
-        callback = adapter._make_run_event_callback(run_id, loop)
+        callback, _, _, _ = adapter._make_run_event_callback(run_id, loop)
         secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
         callback(
             "subagent.complete",
@@ -907,6 +907,8 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["run_goals"] is True
+            assert data["features"]["session_goal_control"] is True
+            assert data["features"]["goal_run_modes"] is True
             assert data["features"]["run_interim_messages"] is True
             assert data["features"]["runs_idempotency"] == {
                 "supported": True,
@@ -918,6 +920,8 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["run_goal_update"] == {
                 "method": "POST", "path": "/v1/runs/{run_id}/goal"}
+            assert data["endpoints"]["session_goal_update"] == {
+                "method": "POST", "path": "/v1/sessions/{session_id}/goal"}
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}

@@ -102,6 +102,8 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     )
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_get("/v1/sessions/{session_id}/goal", adapter._handle_session_goal)
+    app.router.add_post("/v1/sessions/{session_id}/goal", adapter._handle_session_goal)
     app.router.add_get("/v1/runs/{run_id}/goal", adapter._handle_run_goal)
     app.router.add_post("/v1/runs/{run_id}/goal", adapter._handle_run_goal)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -157,6 +159,89 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_goal_start_is_idempotent_and_uses_canonical_goal_prompt(self, adapter):
+        from hermes_cli.goals import GoalManager
+
+        app = _create_runs_app(adapter)
+        session_id = f"goal-start-{time.time_ns()}"
+        GoalManager(session_id).set("old goal", max_turns=3)
+        captured = []
+
+        def make_agent(**_kwargs):
+            agent = MagicMock()
+
+            def run_conversation(**kwargs):
+                captured.append(kwargs["user_message"])
+                GoalManager(session_id).mark_done("test complete")
+                return {"final_response": "done"}
+
+            agent.run_conversation.side_effect = run_conversation
+            agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=make_agent):
+                body = {
+                    "mode": "goal_start", "goal": "ship the goal API",
+                    "session_id": session_id,
+                }
+                headers = {"Idempotency-Key": "goal-start-one"}
+                first = await cli.post("/v1/runs", json=body, headers=headers)
+                replay = await cli.post("/v1/runs", json=body, headers=headers)
+                first_data, replay_data = await first.json(), await replay.json()
+                await self._wait_completed(cli, first_data["run_id"])
+                events = await (
+                    await cli.get(f"/v1/runs/{first_data['run_id']}/events")
+                ).text()
+
+        assert first.status == replay.status == 202
+        assert first_data["run_id"] == replay_data["run_id"]
+        assert replay_data["replayed"] is True
+        assert captured == ["ship the goal API"]
+        assert GoalManager(session_id).state.goal == "ship the goal API"
+        assert GoalManager(session_id).state.status == "done"
+        assert '"message": "Continuing toward goal"' in events
+
+    @pytest.mark.asyncio
+    async def test_goal_resume_resets_budget_and_uses_continuation_prompt(self, adapter):
+        from hermes_cli.goals import GoalManager
+
+        app = _create_runs_app(adapter)
+        session_id = f"goal-resume-{time.time_ns()}"
+        manager = GoalManager(session_id)
+        manager.set("finish migration", max_turns=7)
+        manager.state.turns_used = 7
+        manager._save()
+        manager.pause("budget exhausted")
+        captured = []
+
+        def make_agent(**_kwargs):
+            agent = MagicMock()
+
+            def run_conversation(**kwargs):
+                captured.append(kwargs["user_message"])
+                GoalManager(session_id).mark_done("test complete")
+                return {"final_response": "done"}
+
+            agent.run_conversation.side_effect = run_conversation
+            agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=make_agent):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"mode": "goal_resume", "session_id": session_id},
+                    headers={"Idempotency-Key": "goal-resume-one"},
+                )
+                data = await response.json()
+                await self._wait_completed(cli, data["run_id"])
+
+        assert response.status == 202
+        assert len(captured) == 1 and "finish migration" in captured[0]
+        assert GoalManager(session_id).state.turns_used == 0
+
     @pytest.mark.asyncio
     async def test_room_auth_is_validated_before_body_parse_or_work_reservation(
         self, auth_adapter
@@ -410,6 +495,86 @@ class TestRunStatus:
                 mock_agent.run_conversation.assert_called_once()
                 assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
                 assert status["session_id"] == "space-session"
+
+
+class TestSessionGoal:
+    @pytest.mark.asyncio
+    async def test_session_goal_survives_without_a_retained_run(self, adapter):
+        app = _create_runs_app(adapter)
+        session_id = f"session-goal-{time.time_ns()}"
+        async with TestClient(TestServer(app)) as cli:
+            created = await cli.post(
+                f"/v1/sessions/{session_id}/goal",
+                json={"action": "create", "objective": "finish docs"},
+            )
+            created_data = await created.json()
+
+        # A fresh API adapter has no retained run state, but the session goal remains manageable.
+        restarted = _make_adapter()
+        restarted_app = _create_runs_app(restarted)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            fetched = await cli.get(f"/v1/sessions/{session_id}/goal")
+            fetched_data = await fetched.json()
+            paused = await cli.post(
+                f"/v1/sessions/{session_id}/goal",
+                json={"action": "pause", "reason": "user-paused"},
+            )
+            paused_data = await paused.json()
+            resumed = await cli.post(
+                f"/v1/sessions/{session_id}/goal",
+                json={"action": "resume"},
+            )
+            resumed_data = await resumed.json()
+            cleared = await cli.post(
+                f"/v1/sessions/{session_id}/goal", json={"action": "clear"}
+            )
+            cleared_data = await cleared.json()
+
+        assert created.status == fetched.status == paused.status == resumed.status == cleared.status == 200
+        assert created_data["goal"]["goal"] == fetched_data["goal"]["goal"] == "finish docs"
+        assert paused_data["goal"]["status"] == "paused"
+        assert resumed_data["goal"]["status"] == "active"
+        assert cleared_data["goal"]["status"] == "cleared"
+
+    @pytest.mark.asyncio
+    async def test_session_pause_waits_for_current_turn_and_blocks_goal_continuation(self, adapter):
+        from hermes_cli.goals import GoalManager
+
+        app = _create_runs_app(adapter)
+        session_id = f"pause-boundary-{time.time_ns()}"
+        GoalManager(session_id).set("keep working")
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        agent = MagicMock()
+
+        def run_conversation(**kwargs):
+            calls.append(kwargs["user_message"])
+            entered.set()
+            release.wait(timeout=5)
+            return {"final_response": "current turn finished"}
+
+        agent.run_conversation.side_effect = run_conversation
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                started = await cli.post(
+                    "/v1/runs", json={"input": "work", "session_id": session_id}
+                )
+                run_id = (await started.json())["run_id"]
+                assert entered.wait(timeout=3)
+                paused = await cli.post(
+                    f"/v1/sessions/{session_id}/goal",
+                    json={"action": "pause", "reason": "paused from Telegram"},
+                )
+                assert paused.status == 200
+                release.set()
+                await TestStartRun._wait_completed(cli, run_id)
+                events = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert calls == ["work"]
+        assert GoalManager(session_id).state.status == "paused"
+        assert '"event": "goal.updated"' in events
 
 
 # ---------------------------------------------------------------------------
@@ -2264,6 +2429,35 @@ class TestHostedRoomRuns:
 
 
 class TestRunGoals:
+    @pytest.mark.asyncio
+    async def test_agent_goal_tool_mutation_publishes_goal_updated(self, adapter):
+        from hermes_cli.goals import GoalManager
+        from tools.goal_tool import update_goal
+
+        session_id = f"tool-goal-{time.time_ns()}"
+        GoalManager(session_id).set("keep going")
+        agent = MagicMock()
+
+        def run_conversation(**_kwargs):
+            update_goal("pause", session_id=session_id, reason="need user input")
+            return {"final_response": "paused"}
+
+        agent.run_conversation.side_effect = run_conversation
+        agent.session_id = session_id
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "work", "session_id": session_id}
+                )
+                run_id = (await response.json())["run_id"]
+                await TestStartRun._wait_completed(cli, run_id)
+                events = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert '"event": "goal.updated"' in events
+        assert '"status": "paused"' in events
+
     @pytest.mark.asyncio
     async def test_goal_control_is_run_owned_and_persistent(self, adapter):
         from hermes_cli import goals
