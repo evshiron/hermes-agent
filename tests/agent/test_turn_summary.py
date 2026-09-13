@@ -15,7 +15,6 @@ from agent.turn_summary import (
     format_elapsed,
     format_token_flow,
     format_turn_summary,
-    tool_activity_label,
 )
 
 
@@ -35,12 +34,6 @@ from agent.turn_summary import (
 )
 def test_format_elapsed(seconds, expected):
     assert format_elapsed(seconds) == expected
-
-
-def test_tool_activity_label_reuses_summary_vocabulary_without_details():
-    assert tool_activity_label("read_file") == "Read file"
-    assert tool_activity_label("web_search") == "Search the web"
-    assert tool_activity_label("third_party_secret_tool") == "Use tool"
 
 
 # ── format_turn_summary: pure formatter ─────────────────────────────────────

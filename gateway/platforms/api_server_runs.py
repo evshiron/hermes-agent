@@ -37,6 +37,30 @@ _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
 _USAGE_FIELDS = (
     ("input_tokens", "session_prompt_tokens"), ("output_tokens", "session_completion_tokens"),
     ("total_tokens", "session_total_tokens"))
+_TOOL_ARGUMENTS_LIMIT = 64
+
+
+def _truncate_middle(text: str, limit: int) -> str:
+    """Bound public previews while preserving the useful beginning and ending."""
+    if len(text) <= limit:
+        return text
+    left = (limit - 3 + 1) // 2
+    right = limit - 3 - left
+    return f"{text[:left]}...{text[-right:]}"
+
+
+def _public_tool_arguments(args: Any, *, redact_sensitive_text: Callable[..., str]) -> str:
+    """Serialize, redact, and bound tool arguments exposed by the Runs API."""
+    if args is None:
+        return ""
+    try:
+        serialized = json.dumps(args, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        serialized = str(args)
+    redacted = redact_sensitive_text(serialized, force=True, redact_url_credentials=True)
+    return _truncate_middle(redacted, _TOOL_ARGUMENTS_LIMIT)
+
+
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
@@ -143,7 +167,6 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
 def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
     """Return callbacks that publish the public, ordered run timeline."""
     redact_sensitive_text = _api_server.redact_sensitive_text
-    from agent.turn_summary import tool_activity_label
 
     def _push(event: Dict[str, Any]) -> None:
         self._set_run_status(
@@ -171,7 +194,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
     def _tool_started(tool_call_id: str, tool_name: str, _args: Any) -> None:
         _push(_run_event(
             run_id, "tool.started", tool_call_id=str(tool_call_id), tool=tool_name,
-            label=tool_activity_label(tool_name)))
+            arguments=_public_tool_arguments(_args, redact_sensitive_text=redact_sensitive_text)))
 
     def _tool_completed(tool_call_id: str, tool_name: str, _args: Any, result: Any) -> None:
         is_error = False
@@ -184,7 +207,8 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
                     is_error = bool(parsed.get("error") or parsed.get("is_error"))
         _push(_run_event(
             run_id, "tool.completed", tool_call_id=str(tool_call_id), tool=tool_name,
-            label=tool_activity_label(tool_name), error=is_error))
+            arguments=_public_tool_arguments(_args, redact_sensitive_text=redact_sensitive_text),
+            error=is_error))
 
     def _interim(text: str, **_kwargs: Any) -> None:
         if not isinstance(text, str) or not text.strip():

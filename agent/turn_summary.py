@@ -19,7 +19,6 @@ __all__ = [
     "format_turn_summary",
     "format_token_flow",
     "format_elapsed",
-    "tool_activity_label",
 ]
 
 
@@ -29,25 +28,25 @@ _MIN_TOOLLESS_SECONDS = 2.0
 # Max "verb + count" segments before collapsing the rest into "+N more".
 _MAX_SEGMENTS = 4
 
-# Tool name -> (verb, singular noun, plural noun, activity label). Unlisted tools (plugin/MCP)
-# fall into a generic "called N tools" bucket.
-_VERB_GROUPS: dict[str, tuple[str, str, str, str]] = {
-    "write_file": ("edited", "file", "files", "Edit file"),
-    "patch": ("edited", "file", "files", "Edit file"),
-    "read_file": ("read", "file", "files", "Read file"),
-    "web_extract": ("read", "page", "pages", "Read page"),
-    "terminal": ("ran", "command", "commands", "Run command"),
-    "execute_code": ("ran", "script", "scripts", "Run script"),
-    "search_files": ("searched", "path", "paths", "Search files"),
-    "web_search": ("searched the web", "time", "times", "Search the web"),
-    "session_search": ("searched sessions", "time", "times", "Search sessions"),
-    "browser_navigate": ("browsed", "page", "pages", "Browse page"),
-    "skill_view": ("read", "skill", "skills", "Read skill"),
-    "skill_manage": ("updated", "skill", "skills", "Update skill"),
-    "skills_list": ("listed skills", "time", "times", "List skills"),
-    "todo_list": ("updated", "task list", "task lists", "Update task list"),
-    "delegate_task": ("delegated", "task", "tasks", "Delegate task"),
-    "memory": ("updated", "memory", "memories", "Update memory"),
+# Tool name -> (verb, singular noun, plural noun). Unlisted tools (plugin/MCP) fall into a
+# generic "called N tools" bucket.
+_VERB_GROUPS: dict[str, tuple[str, str, str]] = {
+    "write_file": ("edited", "file", "files"),
+    "patch": ("edited", "file", "files"),
+    "read_file": ("read", "file", "files"),
+    "web_extract": ("read", "page", "pages"),
+    "terminal": ("ran", "command", "commands"),
+    "execute_code": ("ran", "script", "scripts"),
+    "search_files": ("searched", "path", "paths"),
+    "web_search": ("searched the web", "time", "times"),
+    "session_search": ("searched sessions", "time", "times"),
+    "browser_navigate": ("browsed", "page", "pages"),
+    "skill_view": ("read", "skill", "skills"),
+    "skill_manage": ("updated", "skill", "skills"),
+    "skills_list": ("listed skills", "time", "times"),
+    "todo_list": ("updated", "task list", "task lists"),
+    "delegate_task": ("delegated", "task", "tasks"),
+    "memory": ("updated", "memory", "memories"),
 }
 
 _EDIT_VERB = "edited"  # verb group that carries file-edit line deltas (+X -Y) when known
@@ -55,14 +54,6 @@ _EDIT_VERB = "edited"  # verb group that carries file-edit line deltas (+X -Y) w
 _VERB_PRIORITY: tuple[str, ...] = ("edited", "read", "ran")
 # Tools whose results may report a unified diff we can count lines from.
 _DIFF_RESULT_TOOLS = frozenset({"patch"})
-
-def tool_activity_label(tool_name: str | None) -> str:
-    """Human-readable public label for one tool call, without arguments or output."""
-    if not tool_name:
-        return "Use tool"
-    group = _VERB_GROUPS.get(tool_name)
-    return group[3] if group is not None else "Use tool"
-
 
 @dataclass
 class TurnTally:
@@ -132,7 +123,7 @@ class TurnSummaryCollector:
             self._tally.other_tools += 1
             return
 
-        verb, _singular, plural, _activity_label = group
+        verb, _singular, plural = group
         nouns = self._tally.verbs.setdefault(verb, {})
         nouns[plural] = nouns.get(plural, 0) + 1
 

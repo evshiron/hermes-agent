@@ -598,16 +598,22 @@ class TestRunEvents:
                     "I'll inspect the repo.", already_streamed=False
                 )
                 callbacks["tool_start_callback"](
-                    "call-a", "terminal", {"command": "SECRET_COMMAND"}
+                    "call-a", "terminal", {"command": "echo hello"}
                 )
                 callbacks["tool_start_callback"](
-                    "call-b", "terminal", {"command": "OTHER_SECRET"}
+                    "call-b", "terminal", {
+                        "command": "0123456789" * 10,
+                        "api_key": "short-secret",
+                    }
                 )
                 callbacks["tool_complete_callback"](
-                    "call-b", "terminal", {}, '{"error": "SECRET_OUTPUT"}'
+                    "call-b", "terminal", {
+                        "command": "0123456789" * 10,
+                        "api_key": "short-secret",
+                    }, '{"error": "SECRET_OUTPUT"}'
                 )
                 callbacks["tool_complete_callback"](
-                    "call-a", "terminal", {}, '{"success": true}'
+                    "call-a", "terminal", {"command": "echo hello"}, '{"success": true}'
                 )
                 callbacks["tool_progress_callback"](
                     "reasoning.available", "_thinking", "SECRET_REASONING", None
@@ -639,11 +645,15 @@ class TestRunEvents:
             ("run.completed", None),
         ]
         assert body.count('"tool": "terminal"') == 4
-        assert body.count('"label": "Run command"') == 4
+        tool_events = [event for event in events if event["event"].startswith("tool.")]
+        assert tool_events[0]["arguments"] == '{"command":"echo hello"}'
+        assert all(len(event["arguments"]) <= 64 for event in tool_events)
+        assert tool_events[1]["arguments"].count("...") == 1
+        assert tool_events[1]["arguments"].startswith('{"command":"0123456789012345678')
+        assert tool_events[1]["arguments"].endswith('90123456789","api_key": "***"}')
         assert '"error": true' in body
         assert '"error": false' in body
-        assert "SECRET_COMMAND" not in body
-        assert "OTHER_SECRET" not in body
+        assert "short-secret" not in body
         assert "SECRET_OUTPUT" not in body
         assert "SECRET_REASONING" not in body
 

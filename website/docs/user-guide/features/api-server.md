@@ -473,6 +473,12 @@ Statuses are retained briefly after terminal states (`completed`, `failed`, or `
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
 
+`tool.started` and `tool.completed` expose the original `tool` name and a
+compact JSON `arguments` string. Arguments are forcibly secret-redacted and
+limited to 64 characters; longer values preserve their beginning and ending
+with the middle replaced by `...`. Tool results are not included in these
+public timeline events.
+
 When the agent delegates work to background subagents, the stream also carries
 `subagent.start` and `subagent.complete` lifecycle events, so clients can
 observe delegation outcomes — including timeouts and failures — instead of the
