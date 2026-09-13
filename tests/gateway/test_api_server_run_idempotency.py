@@ -6,6 +6,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 
 
 @pytest.mark.asyncio
@@ -41,3 +42,18 @@ async def test_disconnect_tolerates_bare_fixture_without_run_idempotency_store()
     adapter._response_store.close.assert_called_once_with()
     adapter._close_cached_session_dbs.assert_called_once_with()
     assert adapter._app is None
+
+
+def test_accepted_steer_receipt_survives_store_reopen(tmp_path):
+    path = str(tmp_path / "runs.db")
+    first = RunIdempotencyStore(path)
+    assert first.lookup_steer("scope", "run", "message", "fingerprint") == "missing"
+    assert first.record_steer("scope", "run", "message", "fingerprint") == "created"
+    first.close()
+
+    reopened = RunIdempotencyStore(path)
+    try:
+        assert reopened.lookup_steer("scope", "run", "message", "fingerprint") == "reused"
+        assert reopened.lookup_steer("scope", "run", "message", "different") == "conflict"
+    finally:
+        reopened.close()

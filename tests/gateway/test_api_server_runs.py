@@ -765,14 +765,17 @@ class TestSteerRun:
         _claim_run(adapter, "run_123")
 
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs/run_123/steer", json={"input": "tighten the ending"})
+            resp = await cli.post("/v1/runs/run_123/steer", json={
+                "input": "tighten the ending", "steer_id": "msg-1"})
             payload = await resp.json()
 
         assert resp.status == 200
         assert payload == {
             "object": "hermes.run.steer",
             "run_id": "run_123",
+            "steer_id": "msg-1",
             "accepted": True,
+            "replayed": False,
         }
         agent.steer.assert_called_once_with("tighten the ending")
         assert adapter._run_statuses["run_123"]["last_event"] == "run.steered"
@@ -780,6 +783,31 @@ class TestSteerRun:
         assert event["event"] == "run.steered"
         assert event["run_id"] == "run_123"
         assert event["accepted"] is True
+        assert event["steer_id"] == "msg-1"
+
+    @pytest.mark.asyncio
+    async def test_repeated_steer_id_is_durable_and_does_not_call_agent_twice(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_123"] = agent
+        adapter._run_streams["run_123"] = asyncio.Queue()
+        adapter._set_run_status("run_123", "running")
+        _claim_run(adapter, "run_123")
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/v1/runs/run_123/steer", json={
+                "input": "tighten", "steer_id": "msg-1"})
+            adapter._set_run_status("run_123", "completed", output="done")
+            adapter._active_run_agents.pop("run_123")
+            second = await cli.post("/v1/runs/run_123/steer", json={
+                "input": "tighten", "steer_id": "msg-1"})
+            second_payload = await second.json()
+
+        assert first.status == 200
+        assert second.status == 200
+        assert second_payload["replayed"] is True
+        agent.steer.assert_called_once_with("tighten")
 
     @pytest.mark.asyncio
     async def test_steer_nonexistent_run_returns_404(self, adapter):
@@ -798,7 +826,7 @@ class TestSteerRun:
         _claim_run(adapter, "run_done")
 
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs/run_done/steer", json={"input": "hello"})
+            resp = await cli.post("/v1/runs/run_done/steer", json={"input": "hello", "steer_id": "msg-1"})
             payload = await resp.json()
 
         assert resp.status == 409
@@ -814,7 +842,7 @@ class TestSteerRun:
         _claim_run(adapter, "run_123")
 
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs/run_123/steer", json={"input": ""})
+            resp = await cli.post("/v1/runs/run_123/steer", json={"input": "", "steer_id": "msg-1"})
             payload = await resp.json()
 
         assert resp.status == 400
@@ -858,7 +886,7 @@ class TestSteerRun:
 
                 steer_resp = await cli.post(
                     f"/v1/runs/{run_id}/steer",
-                    json={"input": "tighten the ending"},
+                    json={"input": "tighten the ending", "steer_id": "msg-1"},
                 )
                 steer_data = await steer_resp.json()
 

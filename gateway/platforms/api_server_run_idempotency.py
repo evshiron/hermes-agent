@@ -104,6 +104,15 @@ class RunIdempotencyStore:
                 self._conn.execute(f"ALTER TABLE run_idempotency ADD COLUMN {column} {ddl}")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_steer_idempotency (
+                scope TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                steer_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (scope, run_id, steer_id)
+            )""")
         self._conn.commit()
         self._lock = threading.Lock()
         self._tighten_permissions()
@@ -221,6 +230,41 @@ class RunIdempotencyStore:
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",
                 (_encode_status(status), time.time(), run_id))
             self._conn.commit()
+
+    def lookup_steer(self, scope: str, run_id: str, steer_id: str, fingerprint: str) -> str:
+        """Return ``missing``, ``reused`` or ``conflict`` for a durable steer receipt."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM run_steer_idempotency WHERE created_at < ?",
+                (time.time() - self.RETENTION_SECONDS,))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT fingerprint FROM run_steer_idempotency "
+                "WHERE scope=? AND run_id=? AND steer_id=?",
+                (scope, run_id, steer_id)).fetchone()
+        if row is None:
+            return "missing"
+        return "reused" if hmac.compare_digest(str(row[0]), fingerprint) else "conflict"
+
+    def record_steer(self, scope: str, run_id: str, steer_id: str, fingerprint: str) -> str:
+        """Persist an accepted steer. The agent call intentionally happens first: a crash can
+        replay guidance, but can never turn an unrecorded steer into silent loss."""
+        with self._immediate_txn():
+            self._conn.execute(
+                "DELETE FROM run_steer_idempotency WHERE created_at < ?",
+                (time.time() - self.RETENTION_SECONDS,))
+            row = self._conn.execute(
+                "SELECT fingerprint FROM run_steer_idempotency "
+                "WHERE scope=? AND run_id=? AND steer_id=?",
+                (scope, run_id, steer_id)).fetchone()
+            if row is not None:
+                self._conn.commit()
+                return "reused" if hmac.compare_digest(str(row[0]), fingerprint) else "conflict"
+            self._conn.execute(
+                "INSERT INTO run_steer_idempotency(scope,run_id,steer_id,fingerprint,created_at) "
+                "VALUES(?,?,?,?,?)", (scope, run_id, steer_id, fingerprint, time.time()))
+            self._conn.commit()
+        return "created"
 
     def close(self) -> None:
         with self._lock:

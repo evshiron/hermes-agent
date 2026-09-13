@@ -1098,12 +1098,6 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
-    # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
-    # agent ref) is what rejects stop-then-steer.
-    if status.get("status") != "running" or not hasattr(agent, "steer"):
-        return _json_error(
-            _openai_error, f"Run is not currently accepting steer input: {run_id}",
-            code="run_not_accepting_steer", status=409)
     body, err = await self._read_json_body(request)
     if err:
         return err
@@ -1113,6 +1107,35 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
         return _json_error(
             _openai_error, "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
             code="invalid_steer_input", status=400)
+    steer_id = str(body.get("steer_id") or request.headers.get("Idempotency-Key") or "").strip()
+    if (not steer_id or len(steer_id) > 255
+            or any(ord(ch) < 33 or ord(ch) > 126 for ch in steer_id)):
+        return _json_error(
+            _openai_error, "steer_id or Idempotency-Key must be 1-255 visible ASCII characters",
+            code="invalid_steer_id", status=400)
+    header_id = request.headers.get("Idempotency-Key", "").strip()
+    if header_id and body.get("steer_id") and header_id != steer_id:
+        return _json_error(
+            _openai_error, "steer_id and Idempotency-Key must match",
+            code="steer_id_mismatch", status=400)
+    scope = self._run_idempotency_scope(request)
+    fingerprint = hashlib.sha256(steer_text.encode()).hexdigest()
+    replay = self._run_idempotency_store.lookup_steer(scope, run_id, steer_id, fingerprint)
+    if replay == "conflict":
+        return _json_error(
+            _openai_error, "steer_id was already used with different input",
+            code="steer_id_conflict", status=409)
+    if replay == "reused":
+        return web.json_response({
+            "object": "hermes.run.steer", "run_id": run_id, "steer_id": steer_id,
+            "accepted": True, "replayed": True})
+    # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
+    # agent ref) is what rejects stop-then-steer. Durable replays above remain readable
+    # after the run settles so a lost HTTP response cannot turn into a second task.
+    if status.get("status") != "running" or not hasattr(agent, "steer"):
+        return _json_error(
+            _openai_error, f"Run is not currently accepting steer input: {run_id}",
+            code="run_not_accepting_steer", status=409)
     try:
         accepted = bool(agent.steer(steer_text))
     except Exception as exc:
@@ -1121,8 +1144,15 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     if not accepted:
         return _json_error(
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)
-    _mark_run_event(self, run_id, "run.steered", accepted=True)
-    return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+    stored = self._run_idempotency_store.record_steer(scope, run_id, steer_id, fingerprint)
+    if stored == "conflict":
+        return _json_error(
+            _openai_error, "steer_id was already used with different input",
+            code="steer_id_conflict", status=409)
+    _mark_run_event(self, run_id, "run.steered", accepted=True, steer_id=steer_id)
+    return web.json_response({
+        "object": "hermes.run.steer", "run_id": run_id, "steer_id": steer_id,
+        "accepted": True, "replayed": stored == "reused"})
 
 
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
