@@ -32,6 +32,8 @@ def offline_node(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_PRIVATE_NODE", "1")
     monkeypatch.setenv("HERMES_NODE_TARGET_MAJOR", "26")
     monkeypatch.setenv("NPM_CONFIG_PREFIX", str(home / "public-npm"))
+    monkeypatch.setenv("CARGO_HOME", str(home / "public-cargo"))
+    monkeypatch.setenv("UV_TOOL_BIN_DIR", str(home / "public-uv"))
     monkeypatch.setenv("HERMES_NPM_TARGET_RANGE", ">=12")
     fixture = tmp_path / "node-v26.8.2-fixture"
     executable(fixture / "bin/node", '#!/bin/sh\necho v26.8.2\n')
@@ -41,6 +43,12 @@ assert "OPENAI_API_KEY" not in os.environ
 if '--version' in sys.argv:
  print('12.0.0'); sys.exit(0)
 if os.environ.get('FAIL_NODE_REINSTALL') == '1': sys.exit(42)
+assert "CARGO_HOME" not in os.environ
+assert "UV_TOOL_BIN_DIR" not in os.environ
+# Simulate a lifecycle script using a conventional user-local installation.
+local = pathlib.Path.home() / '.local/bin'
+local.mkdir(parents=True, exist_ok=True)
+(local / 'lifecycle-tool').write_text('fixture')
 root = pathlib.Path(os.environ['NPM_CONFIG_PREFIX'])
 for spec in sys.argv[1:]:
  if spec.startswith('-') or '@' not in spec: continue
@@ -98,6 +106,7 @@ def test_private_install_upgrade_and_heal_never_publish_to_user(offline_node, mo
     provision(profile, browser=True)
     assert json.loads((profile / 'node-packages.json').read_text())['example'] == '1.2.3'
     assert (node / 'etc/npmrc').read_text() == f'prefix={node}\n'
+    assert (profile / 'home/.local/bin/lifecycle-tool').is_file()
     assert not (home / '.local').exists()
     assert not (home / 'public-npm').exists()
     assert not (home / '.npmrc').exists()

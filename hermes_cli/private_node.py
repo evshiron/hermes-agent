@@ -33,10 +33,23 @@ def automatic_installs_allowed() -> bool:
 def node_env(node: Path) -> dict[str, str]:
     from tools.environments.local import hermes_subprocess_env
     env = hermes_subprocess_env(inherit_credentials=False)
-    # Inherited npm flags must not redirect the transaction to the user's tree.
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home() / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    # Lifecycle scripts also use other installers: their defaults and inherited
+    # overrides must not redirect writes into the operator's home.
     for key in list(env):
-        if key.lower().startswith("npm_config_"):
+        if key.upper().startswith(("NPM_CONFIG_", "PIP_", "UV_", "CARGO_", "RUSTUP_", "XDG_")) or key in {
+            "PYTHONUSERBASE", "PYTHONPATH", "GOPATH", "GOBIN", "GOENV", "BUN_INSTALL",
+            "BASH_ENV", "ENV", "ZDOTDIR", "HERMES_REAL_HOME",
+        }:
             del env[key]
+    env.update(HOME=str(home), TERMINAL_HOME_MODE="profile",
+               XDG_CONFIG_HOME=str(home / ".config"),
+               XDG_DATA_HOME=str(home / ".local/share"),
+               XDG_STATE_HOME=str(home / ".local/state"),
+               PYTHONUSERBASE=str(home / ".local"), PIP_CONFIG_FILE=os.devnull,
+               UV_NO_CONFIG="1")
     env.update(PATH=str(node / "bin") + os.pathsep + env.get("PATH", ""),
                NPM_CONFIG_PREFIX=str(node), NPM_CONFIG_USERCONFIG=os.devnull,
                NPM_CONFIG_CACHE=str(node.parent / "npm-cache"),
