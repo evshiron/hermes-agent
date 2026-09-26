@@ -224,3 +224,30 @@ class TestSnapshotEndToEnd:
         assert str(fake_n_bin) in output
         # bashrc short-circuited on the interactive guard — its export never ran
         assert "FROM_BASHRC=bashrc-should-not-appear" not in output
+
+
+@pytest.mark.parametrize("startup_file", [".profile", ".bashrc"])
+def test_embedded_private_profile_keeps_host_supplied_path(tmp_path, monkeypatch, startup_file):
+    profile = tmp_path / "profile"
+    home = profile / "home"
+    home.mkdir(parents=True)
+    tool = profile / "node/bin/private-test-tool"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("#!/bin/sh\necho private-tool\n")
+    tool.chmod(0o755)
+    # Login initialization used to source this and overwrite the managed PATH.
+    (home / startup_file).write_text('export PATH=/usr/bin:/bin; export USER_STARTUP_LOADED=yes\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_PRIVATE_NODE", "1")
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
+    monkeypatch.setenv("PATH", str(tool.parent) + os.pathsep + os.environ["PATH"])
+    shell = LocalEnvironment(cwd=str(home), timeout=15)
+    try:
+        result = shell.execute('private-test-tool; echo "startup=${USER_STARTUP_LOADED:-none}"; echo "HOME=$HOME"')
+        assert result["returncode"] == 0
+        assert "private-tool" in result["output"]
+        assert "startup=none" in result["output"]
+        assert f"HOME={home}" in result["output"]
+    finally:
+        shell.cleanup()
