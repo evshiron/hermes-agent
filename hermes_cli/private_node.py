@@ -31,7 +31,8 @@ def automatic_installs_allowed() -> bool:
 
 
 def node_env(node: Path) -> dict[str, str]:
-    env = dict(os.environ)
+    from tools.environments.local import hermes_subprocess_env
+    env = hermes_subprocess_env(inherit_credentials=False)
     # Inherited npm flags must not redirect the transaction to the user's tree.
     for key in list(env):
         if key.lower().startswith("npm_config_"):
@@ -39,7 +40,7 @@ def node_env(node: Path) -> dict[str, str]:
     env.update(PATH=str(node / "bin") + os.pathsep + env.get("PATH", ""),
                NPM_CONFIG_PREFIX=str(node), NPM_CONFIG_USERCONFIG=os.devnull,
                NPM_CONFIG_CACHE=str(node.parent / "npm-cache"),
-               CAMOFOX_SKIP_DOWNLOAD="1")
+               XDG_CACHE_HOME=str(node.parent / "cache"), CAMOFOX_SKIP_DOWNLOAD="1")
     return env
 
 

@@ -25,6 +25,7 @@ def offline_node(tmp_path, monkeypatch):
     home.mkdir()
     profile = home / "profile"
     profile.mkdir()
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-installer")
     monkeypatch.setenv("HERMES_PYTHON", sys.executable)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(profile))
@@ -36,6 +37,7 @@ def offline_node(tmp_path, monkeypatch):
     executable(fixture / "bin/node", '#!/bin/sh\necho v26.8.2\n')
     npm = '''#!/usr/bin/env python3
 import json, os, pathlib, sys
+assert "OPENAI_API_KEY" not in os.environ
 if '--version' in sys.argv:
  print('12.0.0'); sys.exit(0)
 if os.environ.get('FAIL_NODE_REINSTALL') == '1': sys.exit(42)
