@@ -134,6 +134,9 @@ def upgrade_managed_npm(npm: str, npm_range: str, *, prefix: Path, quiet: bool =
     into ``$HERMES_HOME/node/etc/npmrc`` (so global installs land on PATH), and without the override
     the "upgrade" would install a second npm elsewhere while the managed one stayed stale.
     """
+    from hermes_cli.private_node import automatic_installs_allowed
+    if not automatic_installs_allowed():
+        return False
     if not quiet:
         print(f"→ Upgrading Hermes-managed npm to satisfy {npm_range}…", flush=True)
     # The desktop app's Node processes execute from this tree; an in-place upgrade while in use

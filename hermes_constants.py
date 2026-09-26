@@ -595,6 +595,11 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
 
 def _run_node_bootstrap(func: str, *, timeout: int, **extra_env: str) -> bool:
     """Source ``scripts/lib/node-bootstrap.sh`` and run shell function *func*."""
+    from hermes_cli.private_node import automatic_installs_allowed, private_node_enabled
+    if not automatic_installs_allowed():
+        return False
+    if private_node_enabled():
+        extra_env.update(HERMES_PRIVATE_NODE="1", HERMES_PYTHON=sys.executable)
     if not _NODE_BOOTSTRAP_SCRIPT.is_file():
         return False
     import subprocess
@@ -614,6 +619,9 @@ def bootstrap_hermes_managed_node() -> str | None:
 
     Hermes never modifies a user-owned toolchain (system, nvm, brew, Nix) that fails ``engines``.
     """
+    from hermes_cli.private_node import automatic_installs_allowed
+    if not automatic_installs_allowed():
+        return None
     existing = find_hermes_node_executable("npm")
     if existing:
         return existing
@@ -635,6 +643,9 @@ def heal_hermes_managed_node() -> bool:
     POSIX installs shell out to ``heal_managed_node`` in ``scripts/lib/node-bootstrap.sh``; Windows
     downloads the portable zip directly (same source as ``install.ps1``). See #80926.
     """
+    from hermes_cli.private_node import automatic_installs_allowed
+    if not automatic_installs_allowed():
+        return False
     global _managed_node_heal_attempted
     if _managed_node_heal_attempted or not hermes_managed_node_tree_present():
         return False
@@ -702,7 +713,8 @@ def find_node_executable(command: str) -> str | None:
     managed = find_hermes_node_executable(command)
     if managed:
         return managed
-    if hermes_managed_node_tree_present():
+    from hermes_cli.private_node import private_node_enabled
+    if hermes_managed_node_tree_present() or private_node_enabled():
         return None
     return find_node_executable_on_path(command)
 

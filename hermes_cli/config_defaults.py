@@ -1617,6 +1617,7 @@ DEFAULT_CONFIG = {
         # enabled (e.g. `elevenlabs`). False = require explicit pip install for everything beyond
         # the base set (restricted/audited/air-gapped environments).
         "allow_lazy_installs": True,
+        "private_node": False,  # Embedded hosts keep Node and npm tools inside this profile.
     },
 
     "cron": {

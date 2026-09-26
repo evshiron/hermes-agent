@@ -23,10 +23,20 @@
 #   HERMES_HOME               (default: $HOME/.hermes)
 # ============================================================================
 
+if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then
+    HERMES_NODE_TARGET_MAJOR="${HERMES_NODE_TARGET_MAJOR:-26}"
+fi
 HERMES_NODE_MIN_VERSION="${HERMES_NODE_MIN_VERSION:-20}"
 HERMES_NODE_TARGET_MAJOR="${HERMES_NODE_TARGET_MAJOR:-22}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_NODE_AVAILABLE=false
+
+# Internal host bridge; Python callers also resolve security.private_node.
+_nb_private_provision() {
+    local root
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" "${HERMES_PYTHON:-python3}" -m hermes_cli.private_node "$@"
+}
 
 # ---------------------------------------------------------------------------
 # Logging — prefer the host script's log_* helpers when present
@@ -64,6 +74,11 @@ _nb_get_link_dir() {
 # untouched. Idempotent no-op when there's no managed npm.
 _nb_configure_npm_prefix() {
     [ -x "$HERMES_HOME/node/bin/npm" ] || return 0
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then
+        mkdir -p "$HERMES_HOME/node/etc"
+        printf 'prefix=%s\n' "$HERMES_HOME/node" > "$HERMES_HOME/node/etc/npmrc"
+        return 0
+    fi
     local _link_dir
     _link_dir="$(_nb_get_link_dir)"
     mkdir -p "$HERMES_HOME/node/etc"
@@ -248,6 +263,10 @@ _nb_try_brew() {
 # ---------------------------------------------------------------------------
 
 _nb_install_bundled_node() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ] && [ "${HERMES_PRIVATE_NODE_STAGE:-0}" != 1 ]; then
+        _nb_private_provision --upgrade
+        return $?
+    fi
     local arch node_arch os_name node_os
     arch=$(uname -m)
     case "$arch" in
@@ -330,7 +349,7 @@ _nb_install_bundled_node() {
     # (e.g. the EBADENGINE recovery provisioning a runtime alongside a working
     # system Node). Skipping the links keeps the user's own node/npm first on
     # PATH instead of shadowing them with ours.
-    if [ "${HERMES_NODE_SKIP_LINKS:-0}" != "1" ]; then
+    if [ "${HERMES_NODE_SKIP_LINKS:-0}" != "1" ] && [ "${HERMES_PRIVATE_NODE:-0}" != 1 ]; then
         mkdir -p "$_link_dir"
         ln -sf "$HERMES_HOME/node/bin/node" "$_link_dir/node"
         ln -sf "$HERMES_HOME/node/bin/npm"  "$_link_dir/npm"
@@ -415,6 +434,12 @@ heal_managed_node() {
 # ---------------------------------------------------------------------------
 
 ensure_node() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then
+        _nb_private_provision || return $?
+        export PATH="$HERMES_HOME/node/bin:$PATH"
+        HERMES_NODE_AVAILABLE=true
+        return 0
+    fi
     HERMES_NODE_AVAILABLE=false
 
     # Repair pre-existing managed installs where `npm install -g` lands off

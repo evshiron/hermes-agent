@@ -454,6 +454,7 @@ resolve_install_layout() {
 }
 
 get_command_link_dir() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then echo "$HERMES_HOME/node/bin"; return; fi
     if is_termux && [ -n "${PREFIX:-}" ]; then
         echo "$PREFIX/bin"
     elif [ "$ROOT_FHS_LAYOUT" = true ]; then
@@ -973,6 +974,13 @@ npm_supports_npmrc() {
 }
 
 check_node() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then
+        source "$(dirname "${BASH_SOURCE[0]}")/lib/node-bootstrap.sh"
+        _nb_private_provision || return $?
+        export PATH="$HERMES_HOME/node/bin:$PATH"
+        HAS_NODE=true
+        return 0
+    fi
     log_info "Checking Node.js (for browser tools)..."
 
     # Repair pre-existing Hermes-managed installs where `npm install -g` lands
@@ -1153,6 +1161,7 @@ install_node_line() {
 }
 
 install_node() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then check_node; return $?; fi
     if [ "$DISTRO" = "termux" ]; then
         log_info "Installing Node.js via pkg..."
         if pkg install -y nodejs >/dev/null; then
@@ -1275,6 +1284,10 @@ check_network_prerequisites() {
 }
 
 install_system_packages() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then
+        log_error "Private runtime: install missing system dependencies manually (ripgrep/ffmpeg/build libraries)."
+        return 1
+    fi
     # Detect what's missing
     HAS_RIPGREP=false
     HAS_FFMPEG=false
@@ -3185,6 +3198,7 @@ print_success() {
 }
 
 ensure_browser() {
+    if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ]; then _nb_private_provision --browser; return $?; fi
     if ! command -v node >/dev/null 2>&1; then
         local node_bin="$HERMES_HOME/node/bin/node"
         if [ -x "$node_bin" ]; then
@@ -3878,6 +3892,11 @@ main() {
     # See detect_install_method().
     echo "git" > "$INSTALL_DIR/.install_method"
 }
+
+if [ "${HERMES_PRIVATE_NODE:-0}" = 1 ] && [ -z "$ENSURE_DEPS" ]; then
+    log_error "Private runtime only supports --ensure; the standalone installer writes shared user configuration."
+    exit 1
+fi
 
 if [ "$MANIFEST_MODE" = true ]; then
     emit_manifest

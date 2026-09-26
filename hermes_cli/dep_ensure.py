@@ -75,9 +75,18 @@ def _find_install_script(package_dir: Path | None = None, repo_root: Path | None
 
 def ensure_dependency(dep: str, interactive: bool = True) -> bool:
     """Ensure a non-Python dependency is available. Returns True if available."""
+    from hermes_cli.private_node import automatic_installs_allowed, private_node_enabled, provision
+    if private_node_enabled() and dep in ("node", "browser"):
+        if not automatic_installs_allowed():
+            return False
+        from hermes_constants import get_hermes_home
+        provision(get_hermes_home(), browser=dep == "browser")
+        return True
     check = _DEP_CHECKS.get(dep)
     if check is None or check():  # unknown dep — don't silently forward to install script
         return check is not None
+    if not automatic_installs_allowed():
+        return False
     script, shell = _find_install_script()
     desc = _DEP_DESCRIPTIONS.get(dep, dep)
     if script is None:
@@ -103,4 +112,6 @@ def ensure_dependency(dep: str, interactive: bool = True) -> bool:
     else:
         cmd = ["bash", str(script), "--ensure", dep]
     run_env = {**hermes_subprocess_env(inherit_credentials=False), "IS_INTERACTIVE": "false"}
+    if private_node_enabled():
+        run_env["HERMES_PRIVATE_NODE"] = "1"
     return subprocess.run(cmd, env=run_env).returncode == 0 and check()

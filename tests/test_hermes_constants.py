@@ -1135,6 +1135,7 @@ class TestHealAttemptFlagSemantics:
     so a later call can retry once the tree is free (#80926)."""
 
     def test_deferral_keeps_flag_clear_and_retries(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
         home = tmp_path / "hermes"
         (home / "node").mkdir(parents=True)
         (home / "node" / "node.exe").write_text("x", encoding="utf-8")
@@ -1156,6 +1157,7 @@ class TestHealAttemptFlagSemantics:
         assert calls["n"] == 2
 
     def test_real_failure_records_attempt(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
         home = tmp_path / "hermes"
         (home / "node").mkdir(parents=True)
         (home / "node" / "node.exe").write_text("x", encoding="utf-8")

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from hermes_cli.private_node import private_node_enabled, automatic_installs_allowed
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import agent_browser_runnable, get_hermes_home, is_termux as _is_termux_environment, node_tool_runnable
 from tools.browser_tool_origin import origin_module as _origin
@@ -84,6 +85,9 @@ def _resolve_npx_bin() -> Optional[str]:
     Bare PATH first would let a broken system npx shadow a healthy managed one,
     so every candidate is validated with ``node_tool_runnable`` before use.
     """
+    if private_node_enabled():
+        npx = get_hermes_home() / "node/bin/npx"
+        return str(npx) if npx.is_file() and node_tool_runnable(str(npx)) else None
     extended_path = _merge_browser_path("")
     for path in ([extended_path] if extended_path else []) + [None]:
         npx = shutil.which("npx", path=path)
@@ -98,6 +102,9 @@ def _agent_browser_candidates(extended_path: str):
     The local lookup uses ``shutil.which`` with an explicit path so Windows resolves the ``.cmd`` shim
     (CreateProcess cannot run npm's extensionless POSIX shim — WinError 193).
     """
+    if private_node_enabled():
+        yield str(get_hermes_home() / "node/bin/agent-browser")
+        return
     yield shutil.which("agent-browser")
     if extended_path:
         yield shutil.which("agent-browser", path=extended_path)
@@ -139,7 +146,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         if candidate and ok(candidate):
             return _accept(candidate)
     # npx fallback (also searches the extended PATH)
-    if _resolve_npx_bin():
+    if (not private_node_enabled() or automatic_installs_allowed()) and _resolve_npx_bin():
         return _accept(_bt.NPX_AGENT_BROWSER_SENTINEL)
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")

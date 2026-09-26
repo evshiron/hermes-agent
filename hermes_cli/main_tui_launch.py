@@ -330,7 +330,8 @@ def _ensure_tui_node() -> None:
     from hermes_cli.main import PROJECT_ROOT
     if shutil.which("node") and shutil.which("npm"):
         return
-    if os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
+    from hermes_cli.private_node import automatic_installs_allowed, private_node_enabled
+    if not automatic_installs_allowed() or os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
         return
 
     helper = PROJECT_ROOT / "scripts" / "lib" / "node-bootstrap.sh"
@@ -344,7 +345,9 @@ def _ensure_tui_node() -> None:
         # edits don't leak back into Python, so the capture is the bridge.
         result = subprocess.run(
             ["bash", "-c", f'source "{helper}" >&2 && ensure_node >&2 && command -v node'],
-            env={**os.environ, "HERMES_HOME": hermes_home},
+            env={**os.environ, "HERMES_HOME": hermes_home,
+                 "HERMES_PRIVATE_NODE": "1" if private_node_enabled() else "0",
+                 "HERMES_PYTHON": sys.executable},
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     except (OSError, subprocess.SubprocessError):
         return

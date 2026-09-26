@@ -21,6 +21,11 @@ from hermes_cli.npm_engine import (
 )
 
 
+@pytest.fixture(autouse=True)
+def allow_npm_repair(monkeypatch):
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+
+
 # Verbatim npm 10 output shape (`npm error`), and the npm 9 shape (`npm ERR!`).
 EBADENGINE_OUTPUT = """
 npm error code EBADENGINE

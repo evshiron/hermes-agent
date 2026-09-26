@@ -951,3 +951,23 @@ These go in `~/.hermes/config.yaml` under the `provider_routing` section:
 :::tip
 Use `hermes config set` to set environment variables — it automatically saves them to the right file (`.env` for secrets, `config.yaml` for everything else).
 :::
+
+### Embedded private Node runtime
+
+Embedded hosts may set `security.private_node: true` and bridge it to
+`HERMES_PRIVATE_NODE=1` for shell installers. This POSIX mode keeps Node, npm and
+all global packages under `$HERMES_HOME/node`, never publishes command links to
+user or system bin directories, and never installs system packages. The full
+standalone installer is unavailable in this mode; use `--ensure node` or
+`--ensure browser`, or the runtime Python's `-m hermes_cli.private_node` command.
+Pass `--upgrade` to replace Node and reinstall the exact package versions recorded
+in `$HERMES_HOME/node-packages.json`. A failed staged install leaves the old tree
+in place. An interrupted activation retaining `.node-previous` requires operator
+inspection before retrying. Package installation scripts still execute as the
+host user; private layout is not an OS sandbox.
+
+`security.allow_lazy_installs: false` and `HERMES_DISABLE_LAZY_INSTALLS=1` also
+block automatic browser dependency installation, Node repair and npm engine
+repair. Explicit operator provisioning remains available. Hosts prepend the
+private `node/bin` only to their child environment and set its npm prefix there;
+they must not add it to shell startup files.
